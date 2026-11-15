@@ -160,12 +160,7 @@ fn engine(rx: &Receiver<Cmd>, tx: Sender<Cmd>) {
             Ok(Cmd::Stop) => {
                 emit(state("stopping", None));
                 sharing::close_all();
-                let stopped = match expect_ok(client::request("POST", "/kiri/stop", None)) {
-                    // An engine older than Stop: its sleep.
-                    Err(e) if e.to_string().contains("404") => expect_ok(client::request("POST", "/kiri/sleep", None)),
-                    r => r,
-                };
-                if let Err(e) = stopped {
+                if let Err(e) = stop() {
                     emit(notice("error", &e.to_string()));
                 }
                 refresh();
@@ -230,6 +225,31 @@ fn engine(rx: &Receiver<Cmd>, tx: Sender<Cmd>) {
     }
 }
 
+/// The window's Stop. While the engine is starting (the pipe's check and
+/// start, for a docker command or for the window) the pipe tells the
+/// window so at once: that start is waited for, bounded as it is, and the
+/// engine then stopped, so a Stop pressed meanwhile is never refused or lost.
+fn stop() -> io::Result<()> {
+    let once = || match expect_ok(client::request("POST", "/kiri/stop", None)) {
+        // An engine older than Stop: its sleep.
+        Err(e) if e.to_string().contains("404") => expect_ok(client::request("POST", "/kiri/sleep", None)),
+        r => r,
+    };
+    for _ in 0..2 {
+        match once() {
+            Err(e) if crate::wake::still_starting(&e.to_string()) => {
+                // Its outcome is the Stop's to report: a start that failed
+                // left nothing running.
+                if let Err(why) = crate::serve::engine_up() {
+                    return Err(io::Error::other(format!("Kiri's engine is not running: {why}")));
+                }
+            }
+            r => return r,
+        }
+    }
+    Err(io::Error::other("Kiri is starting; press Stop again in a moment"))
+}
+
 /// Follows the daemon's event stream on its own thread; each event asks
 /// the engine for a refresh. Reconnects when the daemon comes back.
 fn watch(tx: Sender<Cmd>) {
@@ -267,41 +287,69 @@ fn wake() -> io::Result<()> {
     if r.ok() || r.status == 404 { Ok(()) } else { Err(io::Error::other(r.error())) }
 }
 
-/// Makes sure the daemon answers: Ubuntu uses the `kiri` systemd service;
-/// the small Kiri Linux distro starts /usr/local/bin/kiri-start instead.
+/// Makes sure the daemon answers, starting it if not: the same start the
+/// pipe makes when a docker command finds it gone (crate::wake), so the
+/// two never run at once.
 pub(crate) fn ensure_daemon() -> io::Result<()> {
-    if client::alive() {
-        return Ok(());
-    }
-    crate::serve::log("engine: not answering; starting it in WSL");
+    crate::serve::engine_ready().map_err(|why| {
+        io::Error::other(if why == crate::wake::STILL_STARTING { format!("{why}: press Start again in a moment") } else { format!("Kiri's engine did not start: {why}") })
+    })
+}
+
+/// Starts the daemon in WSL and waits until `answers` (given how long it
+/// may take), all by `until`: each call into WSL is ended when it runs
+/// past it, the engine's sync included. Ubuntu uses the `kiri` systemd
+/// service; the small Kiri Linux distro starts /usr/local/bin/kiri-start
+/// instead.
+pub(crate) fn start_daemon(answers: impl Fn(Duration) -> bool, until: std::time::Instant) -> io::Result<()> {
+    use crate::wake::output_by;
+    use std::time::Instant;
+    let out_of_time = |doing: &str, e: &io::Error| io::Error::new(io::ErrorKind::TimedOut, format!("the start ran out of time {doing} ({e})"));
     // The engine this app installed, not one an update left behind.
-    match crate::update::sync_engine() {
+    match crate::update::sync_engine(until) {
         Ok(true) => crate::serve::log("engine: copied this version's engine into WSL"),
         Ok(false) => {}
+        // WSL itself hung: so would the start.
+        Err(e) if e.kind() == io::ErrorKind::TimedOut => return Err(out_of_time("copying the engine into WSL", &e)),
         Err(e) => crate::serve::log(&format!("engine: could not copy the engine into WSL ({e}); starting the one there")),
     }
     let distro = distro();
+    let kiri_linux = distro.as_deref() == Some(crate::setup::KIRI_DISTRO);
+    let (what, args): (&str, &[&str]) = if kiri_linux { ("kiri-start", &["/usr/local/bin/kiri-start"]) } else { ("systemctl start kiri", &["systemctl", "start", "kiri"]) };
     let mut cmd = crate::win::tool("wsl.exe");
     if let Some(d) = &distro {
         cmd.args(["-d", d]);
     }
     std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000);
-    let started = cmd.args(["-u", "root", "--", "systemctl", "start", "kiri"]).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
-    if !started.is_ok_and(|s| s.success()) {
-        let mut cmd = crate::win::tool("wsl.exe");
-        if let Some(d) = &distro {
-            cmd.args(["-d", d]);
+    cmd.args(["-u", "root", "--"]).args(args).stdin(std::process::Stdio::null());
+    // What it said when it failed, and whether the daemon may still come up.
+    let failed = match output_by(&mut cmd, until) {
+        Ok(o) if o.status.success() => None,
+        Ok(o) => {
+            let said = String::from_utf8_lossy(if o.stderr.is_empty() { &o.stdout } else { &o.stderr }).replace('\0', "");
+            let said = said.lines().map(str::trim).find(|l| !l.is_empty()).map_or_else(|| format!("{what} failed ({})", o.status), |l| format!("{what}: {l}"));
+            // kiri-start says by its exit code whether the daemon may still
+            // come up. An Ubuntu without systemd has no `kiri` service: WSL's
+            // boot command starts the daemon there (contrib/wsl/install.sh).
+            if kiri_linux && crate::wake::cannot_start(o.status.code()) {
+                return Err(io::Error::other(said));
+            }
+            Some(said)
         }
-        std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000);
-        let _ = cmd.args(["-u", "root", "--", "/usr/local/bin/kiri-start"]).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
-    }
-    for _ in 0..100 {
-        if client::alive() {
+        Err(e) if e.kind() == io::ErrorKind::TimedOut => return Err(out_of_time("starting the engine in WSL", &e)),
+        Err(e) => return Err(io::Error::other(format!("wsl.exe could not run {what}: {e}"))),
+    };
+    // Started: until the deadline. Otherwise (kiri-start gave up on the
+    // socket with the daemon running, a slow disk): a while more.
+    let until = if failed.is_some() { until.min(Instant::now() + crate::wake::AFTER_SLOW_START) } else { until };
+    let left = || until.saturating_duration_since(Instant::now());
+    while !left().is_zero() {
+        if answers(left()) {
             return Ok(());
         }
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(left().min(Duration::from_millis(500)));
     }
-    Err(io::Error::other("Kiri's engine did not start in WSL: run contrib\\windows\\kiri.ps1 to install it"))
+    Err(io::Error::other(failed.unwrap_or_else(|| format!("it did not answer in time after {what}"))))
 }
 
 /// `docker build` through Kiri, as on the Mac: BuildKit in a Kiri container
@@ -369,12 +417,20 @@ fn refresh() {
             emit(v.to_string());
             vm_panel();
         }
-        Err(_) => {
+        Err(e) => {
             RUNNING.lock().unwrap_or_else(PoisonError::into_inner).clear();
             Handle.set_menu(Menu { vm: "Not running".into(), running: Vec::new() });
-            emit(state("stopped", None));
+            // Starting, not stopped, while the pipe starts the engine.
+            emit(state(down_state(&e), None));
         }
     }
+}
+
+/// The window's state when the engine did not answer: the pipe answers the
+/// window at once while it starts the engine (serve::Hub::ready_now), and
+/// that is starting, not stopped.
+fn down_state(e: &io::Error) -> &'static str {
+    if crate::wake::still_starting(&e.to_string()) { "booting" } else { "stopped" }
 }
 
 /// The sidebar's engine panel and the tray menu's state.
@@ -401,9 +457,9 @@ fn vm_panel() {
             let running = RUNNING.lock().unwrap_or_else(PoisonError::into_inner).clone();
             Handle.set_menu(Menu { vm: if awake { "Running" } else if stopped { "Stopped" } else { "Asleep" }.into(), running });
         }
-        Err(_) => {
+        Err(e) => {
             Handle.set_menu(Menu { vm: "Not running".into(), running: Vec::new() });
-            emit(state("stopped", None));
+            emit(state(down_state(&e), None));
         }
     }
 }

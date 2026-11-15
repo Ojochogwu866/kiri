@@ -19,7 +19,7 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::Storage::FileSystem::{CreateFileW, FlushFileBuffers, ReadFile, WriteFile, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, OPEN_EXISTING, PIPE_ACCESS_DUPLEX};
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PeekNamedPipe, SetNamedPipeHandleState, WaitNamedPipeW, PIPE_READMODE_MESSAGE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_MESSAGE,
+    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId, PeekNamedPipe, SetNamedPipeHandleState, WaitNamedPipeW, PIPE_READMODE_MESSAGE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_MESSAGE,
     PIPE_WAIT,
 };
 use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
@@ -105,6 +105,13 @@ impl Pipe {
     pub fn cancel(&self) {
         // SAFETY: our handle; cancelling nothing is harmless.
         unsafe { CancelIoEx(self.h, ptr::null()) };
+    }
+
+    /// The connected client's process id.
+    pub fn client_pid(&self) -> Option<u32> {
+        let mut pid = 0u32;
+        // SAFETY: our handle and a u32 to write the id into.
+        (unsafe { GetNamedPipeClientProcessId(self.h, &mut pid) } != 0).then_some(pid)
     }
 
     /// Whether the client is still connected, without reading.

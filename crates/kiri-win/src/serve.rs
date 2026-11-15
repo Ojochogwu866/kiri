@@ -5,7 +5,7 @@ use std::io::{self, BufReader, Read, Write};
 use std::os::windows::process::CommandExt;
 use std::process::{Child, ChildStdin, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -36,6 +36,13 @@ const LIMIT_NO_CREDIT: usize = 256 * 64 * 1024;
 /// How long a new connection waits for a bridge just started to say it
 /// does flow control; an older one never does.
 const HELLO_WAIT: Duration = Duration::from_secs(5);
+/// A new bridge starts at most this often: with WSL broken, each wsl.exe
+/// exits at once, and every check would start more.
+const BRIDGE_EVERY: Duration = Duration::from_secs(1);
+
+/// How long the engine has to answer the pipe's own ping.
+const PING_WAIT: Duration = crate::wake::CHECK_LIMIT;
+const PING: &[u8] = b"GET /_ping HTTP/1.1\r\nHost: kiri\r\nConnection: close\r\n\r\n";
 
 /// wsl.exe without a console window flashing up.
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -75,16 +82,28 @@ pub fn set_setup_pending(pending: bool) {
 
 const SETUP_UNFINISHED: &str = "Kiri's setup isn't finished: open Kiri to finish it";
 
-/// Answers a client that got nothing from the engine while setup is
-/// unfinished: docker prints "Error response from daemon: <message>".
-/// True if it answered.
-fn refuse_unfinished(pipe: &Pipe) -> bool {
-    if !SETUP_PENDING.load(Ordering::SeqCst) {
-        return false;
-    }
-    let body = serde_json::json!({ "message": SETUP_UNFINISHED }).to_string();
-    let reply = format!("HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
-    if pipe.write(reply.as_bytes()).is_err() {
+fn setup_pending() -> bool {
+    SETUP_PENDING.load(Ordering::SeqCst)
+}
+
+/// How long a client's request may take to come before it is answered
+/// anyway.
+const REQUEST_WAIT: Duration = Duration::from_secs(2);
+
+/// `refuse`, for a client whose request has not been read yet: read
+/// first, as a reply that comes before the request is one Go's HTTP client
+/// calls unsolicited and drops. Setup unfinished is why, when it is.
+fn refuse_new(pipe: &Pipe, message: &str) -> bool {
+    let mut buf = vec![0u8; 64 * 1024];
+    let n = pipe.read_within(&mut buf, Some(REQUEST_WAIT)).unwrap_or(0);
+    refuse(pipe, crate::wake::is_head(&buf[..n]), if setup_pending() { SETUP_UNFINISHED } else { message })
+}
+
+/// Answers a client the engine cannot, with why: docker prints "Error
+/// response from daemon: <message>" rather than "No process is on the
+/// other end of the pipe". True if it answered.
+fn refuse(pipe: &Pipe, head: bool, message: &str) -> bool {
+    if pipe.write(&crate::wake::refusal(head, message)).is_err() {
         return false;
     }
     pipe.flush();
@@ -119,7 +138,7 @@ pub fn start(cfg: Config) -> io::Result<()> {
     let first = Pipe::create(&cfg.pipe, true)?;
     log(&format!("serving {} ({})", cfg.pipe, cfg.distro.as_deref().unwrap_or("default distro")));
     let pipe_name = cfg.pipe.clone();
-    let hub = Arc::new(Hub { cfg: Mutex::new(cfg), current: Mutex::new(None), next_id: AtomicU32::new(1) });
+    let hub = Arc::new(Hub { cfg: Mutex::new(cfg), current: Mutex::new(None), next_id: AtomicU32::new(1), engine: crate::wake::Gate::default(), checking: AtomicBool::new(false) });
     let _ = HUB.set(hub.clone());
     let h = hub.clone();
     thread::Builder::new().name("kiri-docker-engine".into()).spawn(move || docker_engine(&h))?;
@@ -338,13 +357,37 @@ struct Hub {
     /// The running bridge; a new one starts when it has died (WSL shut down).
     current: Mutex<Option<Arc<Bridge>>>,
     next_id: AtomicU32,
+    /// Whether the daemon behind the bridge answers; it dies with WSL.
+    engine: crate::wake::Gate,
+    /// A check for the window's own connections is under way (`check_soon`).
+    checking: AtomicBool,
+}
+
+/// The engine answers, started first if it does not (the window's Start,
+/// and launch): Err says why not.
+pub fn engine_ready() -> Result<(), String> {
+    let hub = HUB.get().ok_or("Kiri is not serving its pipe")?;
+    hub.engine.recheck();
+    hub.ready().map(drop)
+}
+
+/// The engine answers, a check or start under way waited for (WAIT at
+/// most) and one begun if it is not known to: the window's Stop, which
+/// then stops it. Not Start's: a failed start's backoff stands.
+pub fn engine_up() -> Result<(), String> {
+    let hub = HUB.get().ok_or("Kiri is not serving its pipe")?;
+    hub.ready().map(drop)
 }
 
 impl Hub {
     fn bridge(&self) -> io::Result<Arc<Bridge>> {
         let mut current = self.current.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(b) = current.as_ref().filter(|b| !b.dead.load(Ordering::SeqCst)) {
-            return Ok(b.clone());
+        if let Some(b) = current.as_ref() {
+            if !b.dead.load(Ordering::SeqCst) {
+                return Ok(b.clone());
+            }
+            // Callers meanwhile wait here, and get the one started next.
+            thread::sleep(BRIDGE_EVERY.saturating_sub(b.started.elapsed()));
         }
         let cfg = self.cfg.lock().unwrap_or_else(PoisonError::into_inner).clone();
         // Until setup has made Kiri's Linux there is nothing to bridge to.
@@ -353,18 +396,110 @@ impl Hub {
         }
         let b = Bridge::start(&cfg)?;
         *current = Some(b.clone());
+        // The last bridge died, most often with WSL, and the daemon with it.
+        self.engine.unsure();
         Ok(b)
+    }
+
+    /// Ok when the daemon answers, starting it in WSL if not; once for all
+    /// the clients connecting meanwhile, each start logged with its outcome.
+    /// At most CHECK_LIMIT and START_LIMIT, the calls into WSL included.
+    fn ready(&self) -> Result<crate::wake::Ready, String> {
+        self.engine.ready(
+            || self.answers(crate::wake::CHECK_LIMIT),
+            || {
+                log("engine: not answering; starting it in WSL");
+                let t0 = Instant::now();
+                let r = crate::engine::start_daemon(|limit| self.answers(limit), t0 + crate::wake::START_LIMIT).map_err(|e| e.to_string());
+                match &r {
+                    Ok(()) => log(&format!("engine: started in {} ms", t0.elapsed().as_millis())),
+                    Err(e) => log(&format!("engine: did not start: {e}")),
+                }
+                r
+            },
+        )
+    }
+
+    /// `ready` for kiri-win's own connections, which never wait for it: the
+    /// window's engine thread makes them, and Start and Stop queue behind
+    /// it. Not known to answer: a check (and start) on a thread of its own,
+    /// and Err at once, STILL_STARTING or the failure within its backoff.
+    fn ready_now(self: &Arc<Self>) -> Result<(), String> {
+        let known = self.engine.known();
+        if !matches!(known, Some(Ok(()))) {
+            self.check_soon();
+        }
+        known.unwrap_or_else(|| Err(crate::wake::STILL_STARTING.into()))
+    }
+
+    /// `ready` for a docker client that has waited already: by `until`,
+    /// the check (and start) on a thread of its own.
+    fn ready_by(self: &Arc<Self>, until: Instant) -> Result<crate::wake::Ready, String> {
+        self.engine.ready_by(until, || self.check_soon())
+    }
+
+    /// `ready`, on a thread of its own, unless one is under way.
+    fn check_soon(self: &Arc<Self>) {
+        if self.checking.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let hub = self.clone();
+        let spawned = thread::Builder::new().name("kiri-engine-check".into()).spawn(move || {
+            // Cleared however it ends, a panic included.
+            let _clear = crate::wake::Clears(&hub.checking);
+            let _ = hub.ready();
+        });
+        if spawned.is_err() {
+            self.checking.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// Whether the daemon answers a ping, asked over the bridge: the pipe's
+    /// own clients wait on this, so it cannot go through the pipe. Within
+    /// `limit` (and PING_WAIT), however the bridge fares.
+    fn answers(&self, limit: Duration) -> bool {
+        // One deadline for the check, a new bridge's start included.
+        let until = Instant::now() + limit.min(PING_WAIT);
+        // A bridge that dies at once (WSL still booting) gets one more go.
+        // A new one can take BRIDGE_EVERY to start: only when that fits in
+        // what is left.
+        for _ in 0..2 {
+            let bridge = if until.saturating_duration_since(Instant::now()) > BRIDGE_EVERY {
+                let Ok(b) = self.bridge() else { return false };
+                b
+            } else {
+                // The current one, if it lives; not waited for while another
+                // caller holds it to start one.
+                let current = self.current.try_lock().ok().and_then(|c| c.as_ref().filter(|b| !b.dead.load(Ordering::SeqCst)).cloned());
+                let Some(b) = current else { break };
+                b
+            };
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            if let Some(up) = bridge.ping(self.next_id.fetch_add(1, Ordering::SeqCst), left) {
+                return up;
+            }
+        }
+        false
     }
 }
 
 #[derive(Debug)]
 struct Bridge {
     input: Mutex<ChildStdin>,
+    /// Its wsl.exe, until it has exited: ended when it stops reading
+    /// `input` (`ping`).
+    child: Mutex<Option<Child>>,
     conns: Mutex<HashMap<u32, Conn>>,
     dead: AtomicBool,
     /// The bridge said hello: it does flow control.
     credit: AtomicBool,
     started: Instant,
+    /// A ping's thread is running (`ping`): never more than one, even when
+    /// its writes into the bridge block.
+    pinging: AtomicBool,
 }
 
 impl Bridge {
@@ -381,15 +516,16 @@ impl Bridge {
             .creation_flags(CREATE_NO_WINDOW)
             .spawn()?;
         let (Some(input), Some(output)) = (child.stdin.take(), child.stdout.take()) else { return Err(io::Error::other("wsl.exe has no stdio")) };
-        let bridge = Arc::new(Bridge { input: Mutex::new(input), conns: Mutex::new(HashMap::new()), dead: AtomicBool::new(false), credit: AtomicBool::new(false), started: Instant::now() });
+        let bridge = Arc::new(Bridge { input: Mutex::new(input), child: Mutex::new(None), conns: Mutex::new(HashMap::new()), dead: AtomicBool::new(false), credit: AtomicBool::new(false), started: Instant::now(), pinging: AtomicBool::new(false) });
         log("bridge started");
+        *bridge.child.lock().unwrap_or_else(PoisonError::into_inner) = Some(child);
         let b = bridge.clone();
-        thread::spawn(move || b.replies(output, child));
+        thread::spawn(move || b.replies(output));
         Ok(bridge)
     }
 
     /// Hands each reply to its connection, until the bridge exits.
-    fn replies(&self, output: impl Read, mut child: Child) {
+    fn replies(&self, output: impl Read) {
         let mut r = BufReader::with_capacity(64 * 1024, output);
         while let Ok(Some((kind, id, data))) = read_frame(&mut r) {
             if kind == ACK {
@@ -431,7 +567,8 @@ impl Bridge {
         for (_, c) in self.conns.lock().unwrap_or_else(PoisonError::into_inner).drain() {
             c.close();
         }
-        let status = child.wait();
+        let child = self.child.lock().unwrap_or_else(PoisonError::into_inner).take();
+        let status = child.map(|mut c| c.wait());
         log(&format!("bridge exited: {status:?}"));
     }
 
@@ -442,6 +579,76 @@ impl Bridge {
             self.dead.store(true, Ordering::SeqCst);
         }
         r
+    }
+
+    /// Whether the daemon answers on connection `id`: Some(false) when it
+    /// refused it (its socket is left from a daemon that died) or said
+    /// nothing within `wait`, None when the bridge itself died meanwhile.
+    /// Its writes into the bridge are bounded too: one that cannot finish
+    /// within `wait` means the bridge has stopped reading (`wake::hung`), and
+    /// it is ended (None: the next ping gets a new bridge), unless it may be
+    /// held up by an upload: then the engine counts as not answering. One
+    /// thread does the writes, and the CLOSE once the reply is in; while one
+    /// is blocked, the next ping does not start another.
+    fn ping(self: &Arc<Self>, id: u32, wait: Duration) -> Option<bool> {
+        let until = Instant::now() + wait;
+        if self.pinging.swap(true, Ordering::SeqCst) {
+            return Some(false);
+        }
+        let (tx, rx) = channel();
+        {
+            let mut conns = self.conns.lock().unwrap_or_else(PoisonError::into_inner);
+            if self.dead.load(Ordering::SeqCst) {
+                self.pinging.store(false, Ordering::SeqCst);
+                return None;
+            }
+            conns.insert(id, Conn { tx, queued: Arc::new(AtomicUsize::new(0)), window: None });
+        }
+        let (sent_tx, sent) = channel();
+        let (done, done_rx) = channel::<()>();
+        let b = self.clone();
+        let spawned = thread::Builder::new().name("kiri-ping".into()).spawn(move || {
+            let ok = b.send(OPEN, id, &[]).and_then(|()| b.send(DATA, id, PING)).is_ok();
+            let _ = sent_tx.send(ok);
+            if ok {
+                // Until the ping has its reply, or has given up on it.
+                let _ = done_rx.recv();
+                let _ = b.send(CLOSE, id, &[]);
+            }
+            b.pinging.store(false, Ordering::SeqCst);
+        });
+        if spawned.is_err() {
+            self.conns.lock().unwrap_or_else(PoisonError::into_inner).remove(&id);
+            self.pinging.store(false, Ordering::SeqCst);
+            return Some(false);
+        }
+        let reply = match sent.recv_timeout(until.saturating_duration_since(Instant::now())) {
+            Ok(true) => rx.recv_timeout(until.saturating_duration_since(Instant::now())),
+            Ok(false) | Err(RecvTimeoutError::Disconnected) => Err(RecvTimeoutError::Disconnected),
+            Err(RecvTimeoutError::Timeout) => {
+                let others_open = {
+                    let mut conns = self.conns.lock().unwrap_or_else(PoisonError::into_inner);
+                    conns.remove(&id);
+                    !conns.is_empty()
+                };
+                if !crate::wake::hung(self.credit.load(Ordering::SeqCst), others_open, wait) {
+                    return Some(false);
+                }
+                log("bridge: not reading what it is sent; ending it");
+                self.dead.store(true, Ordering::SeqCst);
+                if let Some(c) = self.child.lock().unwrap_or_else(PoisonError::into_inner).as_mut() {
+                    let _ = c.kill();
+                }
+                return None;
+            }
+        };
+        self.conns.lock().unwrap_or_else(PoisonError::into_inner).remove(&id);
+        drop(done);
+        match reply {
+            Ok(Reply::Data(_)) => Some(true),
+            Ok(_) | Err(RecvTimeoutError::Timeout) => Some(false),
+            Err(RecvTimeoutError::Disconnected) => None,
+        }
     }
 
     /// Whether this bridge does flow control, waiting for its hello while
@@ -459,11 +666,13 @@ impl Bridge {
 
 /// One docker client: its requests go over the bridge, on this thread, and
 /// the replies come back on another.
-fn serve(hub: &Hub, pipe: Pipe) {
+fn serve(hub: &Arc<Hub>, pipe: Pipe) {
     serve_shared(hub, Arc::new(pipe));
 }
 
-fn serve_shared(hub: &Hub, pipe: Arc<Pipe>) {
+fn serve_shared(hub: &Arc<Hub>, pipe: Arc<Pipe>) {
+    // kiri-win's own (the window's): never held up by a start.
+    let own = pipe.client_pid() == Some(std::process::id());
     // A bridge can die between hub.bridge() and the insert below: while WSL
     // is still booting, wsl.exe exits at once. `replies` ends every
     // connection it finds when that happens, but one registered after that
@@ -473,19 +682,53 @@ fn serve_shared(hub: &Hub, pipe: Arc<Pipe>) {
     // So the insert checks `dead` under the lock the sweep takes, and a
     // bridge found dead is left for the next one.
     let mut tries = 0;
+    let mut checked = false;
+    // One deadline for all this client waits on the engine: its first check
+    // (and start), those of the bridges that replace one that died, and the
+    // one after the engine closes it before a word. A new bridge may take
+    // BRIDGE_EVERY to start first.
+    let until = Instant::now() + BRIDGE_EVERY + crate::wake::WAIT;
     let (bridge, id, window, rx, queued) = loop {
+        // A new bridge, and the engine behind it checked, no longer fit.
+        if tries > 0 && !own && until.saturating_duration_since(Instant::now()) <= BRIDGE_EVERY {
+            hub.check_soon();
+            if refuse_new(&pipe, &crate::wake::message(crate::wake::STILL_STARTING)) {
+                linger(&pipe);
+            }
+            return;
+        }
         let bridge = match hub.bridge() {
             Ok(b) => b,
             Err(e) => {
                 if e.kind() != io::ErrorKind::NotConnected {
                     log(&format!("bridge: {e}"));
                 }
-                if refuse_unfinished(&pipe) {
+                let answered = if e.kind() == io::ErrorKind::NotConnected { setup_pending() && refuse_new(&pipe, SETUP_UNFINISHED) } else { refuse_new(&pipe, &crate::wake::message(&format!("WSL did not start Kiri's Linux ({e})"))) };
+                if answered {
                     linger(&pipe);
                 }
                 return;
             }
         };
+        // The daemon behind it may have died with WSL: started again first,
+        // or the client is told why not. Then whichever bridge is current.
+        if !checked {
+            checked = true;
+            let ready = if own {
+                hub.ready_now()
+            } else if tries == 0 {
+                hub.ready().map(drop)
+            } else {
+                hub.ready_by(until).map(drop)
+            };
+            if let Err(why) = ready {
+                if refuse_new(&pipe, &crate::wake::message(&why)) {
+                    linger(&pipe);
+                }
+                return;
+            }
+            continue;
+        }
         let id = hub.next_id.fetch_add(1, Ordering::SeqCst);
         // The client's input waits for the bridge's credit (the daemon holds
         // back an attach's stdin until the container reads it), and its
@@ -506,19 +749,37 @@ fn serve_shared(hub: &Hub, pipe: Arc<Pipe>) {
             break (bridge, id, window, rx, queued);
         }
         bridge.conns.lock().unwrap_or_else(PoisonError::into_inner).remove(&id);
+        // The next bridge is most often a new one (WSL started again), with
+        // no daemon behind it: checked first, as this one was.
+        checked = false;
         tries += 1;
         if tries == 3 {
             log("bridge: died three times while a connection opened; giving up on it");
+            if refuse_new(&pipe, &crate::wake::message("Kiri's Linux in WSL stopped three times as the command came in")) {
+                linger(&pipe);
+            }
             return;
         }
     };
-    let (p, b, w) = (pipe.clone(), bridge.clone(), window.clone());
-    let writer = thread::spawn(move || to_client(&p, &rx, &queued, w.as_deref().map(|w| (&*b, id, w))));
+    // Whether the client's request has come, and is a HEAD: a reply the
+    // writer makes itself waits for it (see `refuse_new`).
+    let request = Arc::new(crate::wake::Arrival::default());
+    // What is left of the deadline, for the check if the engine closes the
+    // connection before a word: time the client's request then took is not
+    // spent waiting on the engine.
+    let left = until.saturating_duration_since(Instant::now());
+    let (p, b, w, r, h) = (pipe.clone(), bridge.clone(), window.clone(), request.clone(), hub.clone());
+    let writer = thread::spawn(move || to_client(&p, &rx, &queued, w.as_deref().map(|w| (&*b, id, w)), &r, (&h, own, left)));
     let mut buf = vec![0u8; 64 * 1024];
+    let mut came = false;
     let end = loop {
         match pipe.read(&mut buf) {
             Ok(0) => break EOF,
             Ok(n) => {
+                if !came {
+                    came = true;
+                    request.set(crate::wake::is_head(&buf[..n]));
+                }
                 // Out of credit with the client gone (nothing to read its
                 // reply), or the connection closed: stop.
                 if window.as_ref().is_some_and(|w| !w.take(n, || pipe.alive())) {
@@ -532,6 +793,8 @@ fn serve_shared(hub: &Hub, pipe: Arc<Pipe>) {
             Err(_) => break CLOSE,
         }
     };
+    // Gone before a word: nothing for the writer to wait for.
+    request.set(false);
     let _ = bridge.send(end, id, &[]);
     let replies_ended = writer.join().unwrap_or(false);
     if end == EOF && replies_ended {
@@ -544,8 +807,13 @@ fn serve_shared(hub: &Hub, pipe: Arc<Pipe>) {
 
 /// Writes the bridge's replies to the client, acknowledging them to the
 /// bridge (`credit`) as they go when it does flow control. True if they
-/// ended with EOF.
-fn to_client(pipe: &Pipe, rx: &Receiver<Reply>, queued: &AtomicUsize, credit: Option<(&Bridge, u32, &Window)>) -> bool {
+/// ended with EOF. `request` is set, to whether it is a HEAD, once the
+/// client's request has been read. `own`: the connection is kiri-win's;
+/// `left`: how long the client may still wait on the engine.
+fn to_client(pipe: &Pipe, rx: &Receiver<Reply>, queued: &AtomicUsize, credit: Option<(&Bridge, u32, &Window)>, request: &crate::wake::Arrival, (hub, own, left): (&Arc<Hub>, bool, Duration)) -> bool {
+    // The engine closed it before a word: answered here, after the
+    // request has come (or REQUEST_WAIT).
+    let head = || request.head(REQUEST_WAIT);
     let mut done = 0usize;
     let mut answered = false;
     for reply in rx {
@@ -572,7 +840,21 @@ fn to_client(pipe: &Pipe, rx: &Receiver<Reply>, queued: &AtomicUsize, credit: Op
             }
             // Closed before a word, with setup unfinished: no engine is
             // listening in Kiri's Linux yet. Say why.
-            Reply::Close if !answered && refuse_unfinished(pipe) => return true,
+            Reply::Close if !answered && setup_pending() && refuse(pipe, head(), SETUP_UNFINISHED) => return true,
+            // Closed before a word otherwise: the daemon may have gone (its
+            // socket refused the bridge). Checked, started again if so, and
+            // the client told which.
+            Reply::Close if !answered && pipe.alive() => {
+                hub.engine.unsure();
+                // The window's own is told at once, and the check runs on.
+                let message = if own {
+                    hub.check_soon();
+                    crate::wake::after_close(Ok(crate::wake::Ready::Answered))
+                } else {
+                    crate::wake::after_close(hub.ready_by(Instant::now() + left))
+                };
+                return refuse(pipe, head(), &message);
+            }
             Reply::Close => break,
         }
     }
