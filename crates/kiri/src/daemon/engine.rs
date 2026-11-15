@@ -746,7 +746,7 @@ impl Engine {
         self.boot_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let guest = crate::guest::Guest::boot(&crate::guest::BootOptions {
             data_disk: true,
-            console_log: Some(crate::diag::console::path()?),
+            console_log: crate::diag::console::path().ok(),
             memory_mib: Some(ceiling >> 20),
             cpus: Some(cpus),
             ..Default::default()
@@ -3185,12 +3185,17 @@ impl Engine {
         if removed.as_ref().is_some_and(|c| !c.spec.auto_remove) {
             self.save();
         }
-        // Lost containers are pruned by retain() on the next boot. Removal
-        // must not boot a replacement or wait for a retiring VM.
-        if removed.as_ref().is_some_and(|c| c.started.is_some() && !c.vm_stopped)
+        // Its writable layer is on the guest's disk, whether it ran in this
+        // boot, the one before a crash, or never started. Removal must not
+        // boot a replacement or wait for a retiring VM: while none is awake,
+        // retain() prunes the layer on the next boot.
+        // The container is already gone: a link that broke a moment ago
+        // doesn't make rm fail, retain() takes the layer on the next boot.
+        if removed.is_some()
             && let Some(vm) = self.awake()
+            && let Err(e) = vm.remove(&id)
         {
-            vm.remove(&id)?;
+            crate::diag::warn!("writable layer left for the next boot", id = id, error = e);
         }
         if with_volumes {
             for v in anon {

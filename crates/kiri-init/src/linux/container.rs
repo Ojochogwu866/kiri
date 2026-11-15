@@ -416,7 +416,9 @@ fn plain_upper(base: &Path) -> io::Result<bool> {
         return Ok(true);
     }
     if fs::read_dir(base.join("upper"))?.next().is_some() {
-        return Ok(false);
+        // A mount that began at the same time may have marked it and
+        // written into it since this one looked for the marker.
+        return Ok(marker.exists());
     }
     fs::write(marker, b"")?;
     Ok(true)

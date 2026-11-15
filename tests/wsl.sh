@@ -63,7 +63,14 @@ t cleanup "web" "docker rm -f web db"
 t crash-setup "ok" "for p in always unless-stopped no; do docker run -d --name cr-\$p --restart \$p alpine sleep 1d >/dev/null; done; docker run -d --name cr-user --restart always alpine sleep 1d >/dev/null; docker stop -t 0 cr-user >/dev/null && echo ok"
 if $D exec kiri-wsl sh -c 'kill -9 $(pgrep -x -P "$(pgrep -xo kiri)" kiri-init)'; then PASS=$((PASS + 1)); else FAIL=$((FAIL + 1)); echo "  FAIL crash-kill: no agent to kill"; fi
 t crash-recovers "cr-always=true cr-unless-stopped=true cr-no=false cr-user=false" "sleep 4; for c in cr-always cr-unless-stopped cr-no cr-user; do printf '%s=%s ' \$c \$(docker inspect -f '{{.State.Running}}' \$c); done"
-t crash-cleanup "cr-always" "docker rm -f cr-always cr-unless-stopped cr-no cr-user"
+# Removing a container the crash stopped, or one never started, deletes its
+# writable layer from the engine's disk.
+for c in crash created; do
+  if [ $c = crash ]; then id=$($D exec kiri-wsl-cli sh -c 'export DOCKER_HOST=unix:///kiri/docker.sock; id=$(docker inspect -f "{{.Id}}" cr-no); docker rm cr-no >/dev/null; echo $id')
+  else id=$($D exec kiri-wsl-cli sh -c 'export DOCKER_HOST=unix:///kiri/docker.sock; id=$(docker create alpine true); docker cp /etc/hostname $id:/f >/dev/null; docker rm $id >/dev/null; echo $id'); fi
+  if [ -n "$id" ] && $D exec kiri-wsl sh -c "for i in \$(seq 20); do test -e /var/lib/kiri/containers/$id || exit 0; sleep 0.1; done; exit 1"; then PASS=$((PASS + 1)); else FAIL=$((FAIL + 1)); echo "  FAIL $c-rm-frees-layer: ${id:-no id} still on disk"; fi
+done
+t crash-cleanup "cr-always" "docker rm -f cr-always cr-unless-stopped cr-user"
 $D rm -f kiri-wsl kiri-wsl-cli >/dev/null
 $D volume rm kiri-wsl-run kiri-wsl-lib kiri-wsl-store >/dev/null 2>&1
 echo "$PASS passed, $FAIL failed"

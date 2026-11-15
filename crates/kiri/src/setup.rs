@@ -101,7 +101,8 @@ pub fn launched_from_app() -> bool {
 /// The first time the app opens: the same as `kiri setup`, quietly, except
 /// `*.kiri.local`, which the window offers and the user chooses.
 pub fn first_launch() -> io::Result<()> {
-    if agent_plist()?.is_file() && agent_runs_this()? {
+    let set_up = agent_plist().and_then(|p| Ok(p.is_file() && agent_runs_this()?)).map_err(step("checking how Kiri starts at login"))?;
+    if set_up {
         // Set up by an older Kiri: make sure the commands are there too.
         if let Some(contents) = bundle_contents() {
             let _ = bundled_cli(&contents);
@@ -113,6 +114,12 @@ pub fn first_launch() -> io::Result<()> {
         return Ok(());
     }
     run(&["--no-domains".to_owned()])
+}
+
+/// Each step's error says which step it was: on first launch it is all the
+/// log has to go on (#250).
+fn step(what: &'static str) -> impl Fn(io::Error) -> io::Error {
+    move |e| io::Error::new(e.kind(), format!("{what}: {e}"))
 }
 
 pub fn run(args: &[String]) -> io::Result<()> {
@@ -131,20 +138,15 @@ pub fn run(args: &[String]) -> io::Result<()> {
         println!("{}", docker_socket_fallback(&crate::daemon::socket_path()?));
         return result;
     }
-    let socket = crate::daemon::socket_path()?;
-    context(&socket)?;
+    let socket = crate::daemon::socket_path().map_err(step("finding the engine's socket"))?;
+    context(&socket).map_err(step("adding the kiri docker context"))?;
     println!("docker context `{CONTEXT}` → unix://{}", socket.display());
     if flag("--use") && !dev() {
-        let path = docker_dir()?.join("config.json");
-        let mut cfg = read_json(&path)?;
+        let path = docker_dir().map(|d| d.join("config.json")).map_err(step("making kiri docker's current context"))?;
+        let mut cfg = read_json(&path).map_err(step("making kiri docker's current context"))?;
         cfg["currentContext"] = CONTEXT.get().into();
-        write_json(&path, &cfg)?;
+        write_json(&path, &cfg).map_err(step("making kiri docker's current context"))?;
         println!("docker now uses Kiri by default (`docker context use default` to switch back)");
-    }
-    // Each step's error says which step it was: on first launch it is all
-    // the log has to go on (#250).
-    fn step(what: &'static str) -> impl Fn(io::Error) -> io::Error {
-        move |e| io::Error::new(e.kind(), format!("{what}: {e}"))
     }
     if let Some(contents) = bundle_contents() {
         bundled_cli(&contents).map_err(step("setting up the kiri and docker commands"))?;

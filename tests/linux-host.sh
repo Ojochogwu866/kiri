@@ -126,7 +126,11 @@ t crash-setup "ok" "for p in always unless-stopped no; do docker run -d --name c
 t crash-kill "killed" "kill -9 \$(ps -o pid,ppid,comm | awk '\$2 == 1 && \$3 == \"kiri-init\" {print \$1}') && echo killed"
 t crash-recovers "cr-always=true cr-unless-stopped=true cr-no=false cr-user=false" "sleep 4; for c in cr-always cr-unless-stopped cr-no cr-user; do printf '%s=%s ' \$c \$(docker inspect -f '{{.State.Running}}' \$c); done"
 t crash-restart-count "1 1" "echo \$(docker inspect -f '{{.RestartCount}}' cr-always cr-unless-stopped)"
-t crash-cleanup "cr-always" "docker rm -f cr-always cr-unless-stopped cr-no cr-user"
+# Removing a container the crash stopped, or one never started, deletes its
+# writable layer from the engine's disk.
+t crash-rm-frees-layer "gone" "id=\$(docker inspect -f '{{.Id}}' cr-no); docker rm cr-no >/dev/null; for i in \$(seq 20); do test -e /var/lib/kiri/containers/\$id || break; sleep 0.1; done; test -e /var/lib/kiri/containers/\$id && echo kept || echo gone"
+t created-rm-frees-layer "gone" "id=\$(docker create alpine true); docker cp /etc/hostname \$id:/f >/dev/null; docker rm \$id >/dev/null; for i in \$(seq 20); do test -e /var/lib/kiri/containers/\$id || break; sleep 0.1; done; test -e /var/lib/kiri/containers/\$id && echo kept || echo gone"
+t crash-cleanup "cr-always" "docker rm -f cr-always cr-unless-stopped cr-user"
 $D rm -f "$N" >/dev/null
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" = 0 ]
