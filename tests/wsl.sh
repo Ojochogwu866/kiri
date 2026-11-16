@@ -53,6 +53,8 @@ t distribution-missing "404" "curl -s -o /dev/null -w '%{http_code}' --unix-sock
 # second with EBUSY (#227). A renamed directory must survive a commit.
 t cp-then-start "failed 0" "f=0; for i in 1 2 3 4 5; do id=\$(docker create alpine sleep 30); docker cp /etc/hostname \$id:/f >/dev/null 2>&1 || f=\$((f+1)); docker start \$id >/dev/null 2>&1 || f=\$((f+1)); docker rm -f \$id >/dev/null; done; echo failed \$f"
 t commit-renamed-dir "kept" "docker rm -f kiri-rename >/dev/null 2>&1; docker run --name kiri-rename alpine mv /etc/apk /etc/apk2; docker commit kiri-rename kiri-rename-test >/dev/null; docker rm -f kiri-rename >/dev/null; docker run --rm kiri-rename-test sh -c 'test -f /etc/apk2/repositories && echo kept'; docker rmi kiri-rename-test >/dev/null"
+# A start that fails once its network is up leaves no name behind (#325).
+t failed-start-no-dns "none" "docker network create kiri-dnsfail >/dev/null 2>&1; docker rm -f kiri-dnsbad >/dev/null 2>&1; docker run -d --name kiri-dnsbad --network kiri-dnsfail --sysctl net.ipv4.kiri_no_such_key=1 alpine sleep 60 >/dev/null 2>&1; docker run --rm --network kiri-dnsfail alpine sh -c 'nslookup kiri-dnsbad 2>&1 | grep -qE \"^Address: [0-9.]+\$\" && echo answered || echo none'; docker rm -f kiri-dnsbad >/dev/null 2>&1; docker network rm kiri-dnsfail >/dev/null"
 t network-dns "PONG" "docker network create wn >/dev/null 2>&1; docker run -d --name db --network wn redis:7-alpine >/dev/null; sleep 2; docker run --rm --network wn redis:7-alpine redis-cli -h db ping"
 t volume "kept" "docker run --rm -v wv:/d alpine sh -c 'echo kept > /d/f' && docker run --rm -v wv:/d alpine cat /d/f"
 t seccomp "Seccomp:	2" "docker run --rm alpine grep Seccomp: /proc/self/status"

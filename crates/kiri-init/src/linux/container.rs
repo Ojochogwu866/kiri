@@ -88,6 +88,35 @@ pub struct Process {
     teardown: Option<Teardown>,
 }
 
+/// What a started container gives the DNS server (see `spawn`).
+struct Names {
+    /// Its A records: not on an IPv6-only network.
+    v4: bool,
+    v6: Option<[u8; 16]>,
+    /// `--dns` servers.
+    servers: Vec<[u8; 4]>,
+}
+
+#[cfg(test)]
+impl Process {
+    /// A container's process with nothing to tear down, for the agent's tests.
+    pub fn for_test(id: &str, pid: libc::pid_t) -> Self {
+        Process {
+            id: id.to_owned(),
+            container: None,
+            pid,
+            stdout: None,
+            stderr: None,
+            stdin: None,
+            tty: false,
+            dns_entries: Vec::new(),
+            veths: Vec::new(),
+            netns: 0,
+            teardown: None,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Teardown {
     base: PathBuf,
@@ -344,6 +373,11 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
         }
     };
     let mut veths = Vec::new();
+    // Names, AAAA records and `--dns` servers to give the DNS server, once
+    // nothing can fail any more: a failed start must not leave its names
+    // answering (#325). Nothing is answered before then anyway, since the
+    // agent serves DNS from its loop, after this returns.
+    let mut names: Option<Names> = None;
     // Not bridged, but with sysctls to write: no network to wait for.
     if let Some(go) = go.take_if(|_| !bridged) {
         drop(prepared.net_ready.take());
@@ -370,29 +404,46 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
             // and its containers no A records.
             if !plug.no_ipv4 {
                 net.dns.serve(spec.net.bridge, spec.net.gateway).map_err(|e| kill_child(io::Error::new(e.kind(), format!("dns: {e}"))))?;
-                net.dns.register(spec.net.bridge, spec.net.dns_names.iter(), spec.net.ip);
             }
             // 127.0.0.11 in the container, when its resolv.conf names it. Not
             // when it names the gateway (the default bridge in the VM): the
             // listener would only hold port 53, and a DNS server in the
             // container could not bind it.
             if nameserver == Some(super::dns::EMBEDDED) {
+                // `pid` is this new child's, so a server already kept under
+                // it belonged to a process that exited and was reaped, still
+                // waiting for its output to be read (see `admit`): it must
+                // not stand in for this container's own.
+                net.dns.drop_container(pid);
                 std::fs::File::open(format!("/proc/{pid}/ns/net"))
                     .and_then(|ns| net.dns.serve_in(&ns, pid, spec.net.ip, spec.net.bridge))
                     .map_err(|e| kill_child(io::Error::new(e.kind(), format!("dns: {e}"))))?;
             }
-            if let Some(v) = v6 {
-                net.dns.register6(spec.net.bridge, spec.net.dns_names.iter(), spec.net.ip, v.ip);
-            }
             // `--dns`: names the network does not know go to these instead.
             let servers: Vec<[u8; 4]> = net_opts::values(spec.net.opts, net_opts::NAMESERVER).filter_map(net::parse_ip).collect();
-            net.dns.set_upstream(spec.net.ip, servers);
+            names = Some(Names { v4: !plug.no_ipv4, v6: v6.map(|v| v.ip), servers });
         }
-        super::hostopts::apply_sysctls(pid, &host.sysctls).map_err(kill_child)?;
+        // Its 127.0.0.11 listener goes with it.
+        super::hostopts::apply_sysctls(pid, &host.sysctls).map_err(|e| {
+            net.dns.drop_container(pid);
+            kill_child(e)
+        })?;
         // SAFETY: one byte to a pipe we own: "your network is ready".
         unsafe { libc::write(go.as_raw_fd(), b"g".as_ptr().cast(), 1) };
     }
-    let (stdin, stdout, stderr) = finish_stdio(parent_io, child_io).map_err(kill_child)?;
+    let (stdin, stdout, stderr) = finish_stdio(parent_io, child_io).map_err(|e| {
+        net.dns.drop_container(pid);
+        kill_child(e)
+    })?;
+    if let Some(Names { v4, v6, servers }) = names {
+        if v4 {
+            net.dns.register(spec.net.bridge, spec.net.dns_names.iter(), spec.net.ip);
+        }
+        if let Some(ip) = v6 {
+            net.dns.register6(spec.net.bridge, spec.net.dns_names.iter(), spec.net.ip, ip);
+        }
+        net.dns.set_upstream(spec.net.ip, servers);
+    }
     Ok(Process {
         id: spec.id.to_owned(),
         container: None,
@@ -689,8 +740,12 @@ pub fn sweep(paths: &Paths, cgroup: &std::path::Path) {
 /// Kills every process in a cgroup and below it, and waits (briefly) until
 /// it is empty.
 fn kill_cgroup(dir: &std::path::Path) {
-    // cgroup.kill is Linux 5.14+; before it, each process, deepest first.
+    // cgroup.kill is Linux 5.14+; before it, each process, deepest first,
+    // frozen first: a process that exits between reading cgroup.procs and
+    // the kill frees its pid for another process to take (#324). Frozen
+    // (waited for), none exits on its own, and SIGKILL still ends them.
     if fs::write(dir.join("cgroup.kill"), "1").is_err() {
+        let _ = super::cgroup::freeze(dir, true);
         fn each(dir: &std::path::Path) {
             if let Ok(entries) = fs::read_dir(dir) {
                 for e in entries.flatten().filter(|e| e.file_type().is_ok_and(|t| t.is_dir())) {
@@ -710,6 +765,9 @@ fn kill_cgroup(dir: &std::path::Path) {
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+    // Something outlived the kill (stuck in the kernel): thawed, so the
+    // cgroup isn't left frozen for the next start of this container.
+    let _ = fs::write(dir.join("cgroup.freeze"), "0");
 }
 
 /// Deletes every container directory not in `keep` and not in `running`.

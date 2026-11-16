@@ -313,9 +313,12 @@ t dns-resolvconf "nameserver 127.0.0.11" $D run --rm --network appnet alpine cat
 # What a kind node's pods are given instead: host.docker.internal's address.
 t dns-via-host-addr "Address" $D run --rm --network appnet alpine nslookup svc 198.19.248.254
 t network-members "db" $D network inspect appnet -f '{{range .Containers}}{{.Name}} {{end}}'
+# A start that fails once its network is up leaves no name behind (#325).
+$D run -d --name dnsbad --network appnet --sysctl net.ipv4.kiri_no_such_key=1 alpine sleep 60 >/dev/null 2>&1
+t dns-failed-start-gone "none" $D run --rm --network appnet alpine sh -c 'nslookup dnsbad 2>&1 | grep -qE "^Address: [0-9.]+$" && echo answered || echo none'
 code network-rm-in-use 1 $D network rm appnet
 code network-dup 1 $D network create appnet
-$D rm -f db svc >/dev/null
+$D rm -f db svc dnsbad >/dev/null
 t network-rm "appnet" $D network rm appnet
 code network-rm-builtin 1 $D network rm bridge
 # --internal: no default route, so anything beyond the network fails at once
